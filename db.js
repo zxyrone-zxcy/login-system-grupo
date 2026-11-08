@@ -1,75 +1,79 @@
-import Database from "better-sqlite3";
+import pg from "pg";
 import bcrypt from "bcrypt";
-const db = new Database("authentication.db");
+import "dotenv/config";
 
-const columns = db.prepare("PRAGMA table_info(users)").all();
-const columnNames = columns.map((column) => column.name);
+// Supabase's pooler requires SSL; keep the pool tiny for serverless.
+const pool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL || undefined,
+  ssl: { rejectUnauthorized: false },
+  max: 3,
+});
 
-console.log(columnNames);
-
-if (!columnNames.includes("confirm_password")) {
-  db.prepare(`ALTER TABLE users ADD COLUMN confirm_password STRING`).run();
+// Create tables and seed admins. Runs once per cold start. It is exposed as a
+// promise (not top-level await) so a database problem becomes a clean 500
+// response instead of crashing the whole function at import time.
+async function seedAdmin(name, username, email, password) {
+  if (!password) return;
+  const { rowCount } = await pool.query(
+    "SELECT 1 FROM users WHERE username = $1",
+    [username],
+  );
+  if (rowCount) return;
+  const hashed = await bcrypt.hash(password, await bcrypt.genSalt());
+  await pool.query(
+    "INSERT INTO users (name, username, email, password, role) VALUES ($1, $2, $3, $4, 'admin')",
+    [name, username, email, hashed],
+  );
 }
 
-if (!columnNames.includes("role")) {
-  db.prepare(
-    `ALTER TABLE users ADD COLUMN role STRING NOT NULL DEFAULT 'user' CHECK (role in ('user', 'admin'))`,
-  ).run();
+async function init() {
+  if (!process.env.DATABASE_URL) {
+    throw new Error("DATABASE_URL is not set");
+  }
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      username TEXT NOT NULL UNIQUE,
+      email TEXT,
+      password TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('user', 'admin'))
+    );
+    CREATE TABLE IF NOT EXISTS session (
+      sid VARCHAR PRIMARY KEY,
+      sess JSON NOT NULL,
+      expire TIMESTAMP(6) NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_session_expire ON session (expire);
+    ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE session ENABLE ROW LEVEL SECURITY;
+  `);
+  await seedAdmin("Jay", "AdminJay", "AdminJay@gmail.com", process.env.ADMIN_JAY_PASSWORD);
+  await seedAdmin("James", "Admin2", "Admin2sederia@gmail.com", process.env.ADMIN2_PASSWORD);
+  console.log("postgres connected");
 }
 
-const findUser = db.prepare("SELECT id FROM users WHERE username = ?");
+const ready = init();
+ready.catch((err) => console.error("Database init failed:", err.message));
 
-if (!findUser.get("AdminJay")) {
-  const salt = await bcrypt.genSalt();
-  const hashedPassword = await bcrypt.hash("MinMin@31", salt);
-  db.prepare(
-    "INSERT INTO users (name, username, email, password, role) VALUES(?, ?, ?, ?, ?)",
-  ).run("Jay", "AdminJay", "AdminJay@gmail.com", hashedPassword, "admin");
+async function getUsers() {
+  const { rows } = await pool.query("SELECT * FROM users WHERE role = 'user'");
+  return rows;
 }
 
-if (!findUser.get("Admin2")) {
-  const salt = await bcrypt.genSalt();
-  const hashedPassword = await bcrypt.hash("Jamesj@20", salt);
-  db.prepare(
-    "INSERT INTO users (name, username, email, password, role) VALUES(?, ?, ?, ?, ?)",
-  ).run("James", "Admin2", "Admin2sederia@gmail.com", hashedPassword, "admin");
-}
-
-const users = db.prepare(`SELECT * FROM users`).all();
-console.log(users);
-
-console.log("sqlite Connected");
-
-function getUsers() {
-  const query = `SELECT * FROM users WHERE role = 'user'`;
-  const users = db.prepare(query).all();
-
-  return users;
-}
-
-function getAdmins() {
-  const query = `SELECT * FROM users WHERE role = 'admin'`;
-  const admins = db.prepare(query).all();
-
-  return admins;
+async function getAdmins() {
+  const { rows } = await pool.query("SELECT * FROM users WHERE role = 'admin'");
+  return rows;
 }
 
 async function Register(user) {
-  const insertdata = db.prepare(
-    "INSERT INTO users (name, username, email, password) VALUES(?, ?, ?, ?)",
-  );
   try {
-    const salt = await bcrypt.genSalt();
-    const hashedPassword = await bcrypt.hash(user.password, salt);
-
-    const query = insertdata.run(
-      user.name,
-      user.username,
-      user.email,
-      hashedPassword,
+    const hashedPassword = await bcrypt.hash(user.password, await bcrypt.genSalt());
+    const result = await pool.query(
+      "INSERT INTO users (name, username, email, password) VALUES ($1, $2, $3, $4) RETURNING id",
+      [user.name, user.username, user.email, hashedPassword],
     );
-
-    return query;
+    return result;
   } catch (err) {
     console.log("error: " + err);
     return;
@@ -77,8 +81,10 @@ async function Register(user) {
 }
 
 async function Login(username, password) {
-  const query = db.prepare(`SELECT * FROM users WHERE username = ?`);
-  const user = query.get(username);
+  const { rows } = await pool.query("SELECT * FROM users WHERE username = $1", [
+    username,
+  ]);
+  const user = rows[0];
 
   if (!user) {
     throw new Error("User not found");
@@ -92,29 +98,26 @@ async function Login(username, password) {
 }
 
 async function sendEmail(email) {
-  const query = db.prepare(`SELECT email FROM users WHERE email = ?`);
-  const user_email = query.get(email);
+  const { rows } = await pool.query("SELECT email FROM users WHERE email = $1", [
+    email,
+  ]);
 
-  if (!user_email) {
+  if (!rows[0]) {
     throw new Error("User email not found.");
   }
-  return user_email;
+  return rows[0];
 }
 
 async function resetPassword(password, confrim_password, email) {
-  const update_password = db.prepare(
-    `UPDATE users SET password = ? WHERE email = ?`,
-  );
-
   if (password !== confrim_password) {
     throw new Error("Password does not match confirm password.");
   }
 
-  const salt = await bcrypt.genSalt();
-  const hashedPassword = await bcrypt.hash(password, salt);
-
-  const query = update_password.run(hashedPassword, email);
-  return query;
+  const hashedPassword = await bcrypt.hash(password, await bcrypt.genSalt());
+  return pool.query("UPDATE users SET password = $1 WHERE email = $2", [
+    hashedPassword,
+    email,
+  ]);
 }
 
-export { db, Register, Login, getUsers, getAdmins, sendEmail, resetPassword };
+export { pool, ready, Register, Login, getUsers, getAdmins, sendEmail, resetPassword };

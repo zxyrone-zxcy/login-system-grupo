@@ -1,5 +1,6 @@
 import express from "express";
 import session from "express-session";
+import connectPgSimple from "connect-pg-simple";
 import "dotenv/config";
 import {
   Register,
@@ -8,9 +9,13 @@ import {
   getAdmins,
   sendEmail,
   resetPassword,
+  pool,
+  ready,
 } from "./db.js";
 
 const app = express();
+app.set("trust proxy", 1);
+const PgStore = connectPgSimple(session);
 import rateLimit from "express-rate-limit";
 
 let limiter = rateLimit({
@@ -28,17 +33,33 @@ let limiter = rateLimit({
 });
 
 app.use(express.json());
+
+// Wait for the database before handling API calls; fail with a clear 500.
+app.use("/api", async (req, res, next) => {
+  try {
+    await ready;
+    next();
+  } catch {
+    res.status(500).json({
+      success: false,
+      message: "Server is misconfigured or the database is unreachable.",
+    });
+  }
+});
 app.get("/", (req, res) => res.redirect("/signin.html"));
 app.use(express.static("public"));
 
 app.use(
   session({
+    store: new PgStore({ pool, tableName: "session" }),
     secret: process.env.SESSION_SECRET || "dev-secret-change-me",
     resave: false,
     saveUninitialized: false,
     cookie: {
       maxAge: 1000 * 60 * 60, // 1 hour
       httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
     },
   }),
 );
@@ -53,9 +74,7 @@ function requireAuth(req, res, next) {
   next();
 }
 
-app.get("/api/admin/users", requireAuth, (req, res) => {
-  const users = getUsers();
-
+app.get("/api/admin/users", requireAuth, async (req, res) => {
   if (req.session.user?.role !== "admin") {
     return res.status(403).json({
       success: false,
@@ -63,6 +82,7 @@ app.get("/api/admin/users", requireAuth, (req, res) => {
     });
   }
 
+  const users = await getUsers();
   res.json({
     success: true,
     message: "Get all Users ",
@@ -70,9 +90,7 @@ app.get("/api/admin/users", requireAuth, (req, res) => {
   });
 });
 
-app.get("/api/admin/admins", requireAuth, (req, res) => {
-  const admins = getAdmins();
-
+app.get("/api/admin/admins", requireAuth, async (req, res) => {
   if (req.session.user?.role !== "admin") {
     return res.status(403).json({
       success: false,
@@ -80,6 +98,7 @@ app.get("/api/admin/admins", requireAuth, (req, res) => {
     });
   }
 
+  const admins = await getAdmins();
   res.json({
     success: true,
     message: "Get all Admins ",
@@ -194,6 +213,17 @@ app.put("/api/user/reset-password", async (req, res) => {
       .json({ success: false, message: "Password does not match" });
   }
 });
-app.listen(PORT, () => {
-  console.log(`Example app listening on port${PORT}`);
+// Last-resort handler so unexpected errors return JSON instead of crashing.
+app.use((err, req, res, next) => {
+  console.error(err);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ success: false, message: "Internal server error" });
 });
+
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`Example app listening on port ${PORT}`);
+  });
+}
+
+export default app;

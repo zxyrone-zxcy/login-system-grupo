@@ -21,14 +21,14 @@
   "homepage": "https://github.com/james-sed/login-system-grupo#readme",
   "dependencies": {
     "bcrypt": "^6.0.0",
-    "better-sqlite3": "^13.0.3",
+    "connect-pg-simple": "^10.0.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "express-rate-limit": "^8.7.0",
-    "express-session": "^1.19.0"
+    "express-session": "^1.19.0",
+    "pg": "^8.23.1"
   },
   "allowScripts": {
-    "bcrypt@6.0.0": true,
-    "better-sqlite3@13.0.3": true
+    "bcrypt@6.0.0": true
   }
 }
