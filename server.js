@@ -28,6 +28,7 @@ let limiter = rateLimit({
 });
 
 app.use(express.json());
+app.get("/", (req, res) => res.redirect("/signin.html"));
 app.use(express.static("public"));
 
 app.use(
